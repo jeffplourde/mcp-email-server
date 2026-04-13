@@ -18,6 +18,11 @@ from typing import Any
 import aioimaplib
 import aiosmtplib
 
+# Default IMAP command timeout is 10s which is far too short for large
+# mailboxes (50K+ messages). Searches with FROM/SUBJECT filters require
+# Bridge to scan headers across the date range, which can take minutes.
+aioimaplib.IMAP4.TIMEOUT_SECONDS = 300  # 5 minutes
+
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails import EmailHandler
 from mcp_email_server.emails.models import (
