@@ -1,4 +1,3 @@
-import asyncio
 import email.utils
 import mimetypes
 import os
@@ -367,11 +366,20 @@ class EmailClient:
         chunks = [email_ids[i : i + chunk_size] for i in range(0, len(email_ids), chunk_size)]
         total_chunks = len(chunks)
 
-        # Fetch all chunks in parallel
-        tasks = [
-            self._fetch_dates_chunk(imap, chunk, chunk_num, total_chunks) for chunk_num, chunk in enumerate(chunks, 1)
-        ]
-        results = await asyncio.gather(*tasks)
+        # Fetch chunks sequentially.
+        #
+        # These must NOT be gathered. A single IMAP connection processes commands
+        # serially and aioimaplib correlates responses by tag, so issuing chunks
+        # concurrently desynchronises that bookkeeping and aborts with
+        # "unexpected tagged (<tag>) response". The failure scales with mailbox
+        # size: a 54k-message INBOX produces 109 chunks and aborts every time,
+        # while a filtered query yielding a single chunk appears to work.
+        #
+        # Serialising costs no real throughput, since the server would have
+        # executed the commands one at a time regardless.
+        results = []
+        for chunk_num, chunk in enumerate(chunks, 1):
+            results.append(await self._fetch_dates_chunk(imap, chunk, chunk_num, total_chunks))
 
         # Merge results
         uid_dates: dict[str, datetime] = {}
