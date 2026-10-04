@@ -1,3 +1,5 @@
+import os
+import sys
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -20,6 +22,70 @@ from mcp_email_server.emails.models import (
 mcp = FastMCP("email")
 
 
+# --- capability gating -------------------------------------------------------
+# Tools that send, delete, mutate config, or write to the filesystem are
+# registered only when explicitly enabled. An unregistered tool does not appear
+# in tools/list at all, so a disabled capability is *absent* rather than merely
+# refused -- the model never sees it and cannot attempt it.
+#
+# Defaults are chosen so local stdio users are unaffected, while a
+# network-exposed transport fails safe:
+#   * stdio            -> writes ALLOWED  (preserves existing local behaviour)
+#   * streamable-http  -> writes DENIED   unless MCP_EMAIL_SERVER_READ_ONLY=false
+# Set MCP_EMAIL_SERVER_READ_ONLY explicitly to override either way.
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_network_transport() -> bool:
+    """True when invoked with a transport that listens on a socket.
+
+    argv is inspected because tool registration happens at import time, before
+    the CLI subcommand runs, so the transport is not otherwise knowable here.
+    """
+    argv = {a.replace("_", "-").lower() for a in sys.argv[1:]}
+    return bool(argv & {"streamable-http", "sse"})
+
+
+READ_ONLY = _env_bool("MCP_EMAIL_SERVER_READ_ONLY", default=_is_network_transport())
+
+ALLOW_SEND = _env_bool("MCP_EMAIL_SERVER_ALLOW_SEND", default=not READ_ONLY)
+ALLOW_DELETE = _env_bool("MCP_EMAIL_SERVER_ALLOW_DELETE", default=not READ_ONLY)
+ALLOW_ADD_ACCOUNT = _env_bool("MCP_EMAIL_SERVER_ALLOW_ADD_ACCOUNT", default=not READ_ONLY)
+ALLOW_ATTACHMENT_DOWNLOAD = _env_bool(
+    "MCP_EMAIL_SERVER_ALLOW_ATTACHMENT_DOWNLOAD", default=not READ_ONLY
+)
+
+
+def optional_tool(enabled: bool, **kwargs):
+    """Register an MCP tool only when `enabled`; otherwise leave it unregistered."""
+    if enabled:
+        return mcp.tool(**kwargs)
+
+    def _skip(fn):
+        return fn
+
+    return _skip
+
+
+def capability_summary() -> str:
+    flags = {
+        "send_email": ALLOW_SEND,
+        "delete_emails": ALLOW_DELETE,
+        "add_email_account": ALLOW_ADD_ACCOUNT,
+        "download_attachment": ALLOW_ATTACHMENT_DOWNLOAD,
+    }
+    on = sorted(k for k, v in flags.items() if v)
+    off = sorted(k for k, v in flags.items() if not v)
+    return f"read_only={READ_ONLY} enabled={on or ['(none)']} disabled={off or ['(none)']}"
+# -----------------------------------------------------------------------------
+
+
 @mcp.resource("email://{account_name}")
 async def get_account(account_name: str) -> EmailSettings | ProviderSettings | None:
     settings = get_settings()
@@ -32,7 +98,7 @@ async def list_available_accounts() -> list[AccountAttributes]:
     return [account.masked() for account in settings.get_accounts()]
 
 
-@mcp.tool(description="Add a new email account configuration to the settings.")
+@optional_tool(ALLOW_ADD_ACCOUNT, description="Add a new email account configuration to the settings.")
 async def add_email_account(email: EmailSettings) -> str:
     settings = get_settings()
     settings.add_email(email)
@@ -117,7 +183,8 @@ async def get_emails_content(
     return await handler.get_emails_content(email_ids, mailbox)
 
 
-@mcp.tool(
+@optional_tool(
+    ALLOW_SEND,
     description="Send an email using the specified account. Supports replying to emails with proper threading when in_reply_to is provided.",
 )
 async def send_email(
@@ -176,7 +243,8 @@ async def send_email(
     return f"Email sent successfully to {recipient_str}{attachment_info}"
 
 
-@mcp.tool(
+@optional_tool(
+    ALLOW_DELETE,
     description="Delete one or more emails by their email_id. Use list_emails_metadata first to get the email_id."
 )
 async def delete_emails(
@@ -196,7 +264,8 @@ async def delete_emails(
     return result
 
 
-@mcp.tool(
+@optional_tool(
+    ALLOW_ATTACHMENT_DOWNLOAD,
     description="Download an email attachment and save it to the specified path. This feature must be explicitly enabled in settings (enable_attachment_download=true) due to security considerations.",
 )
 async def download_attachment(
